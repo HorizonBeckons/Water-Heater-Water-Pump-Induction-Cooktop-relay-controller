@@ -1,0 +1,321 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <FastLED.h>
+
+// Pin Definitions
+#define RELAY_INDUCTION    5   // D1 - Relay 1 (Induction Cooktop)
+#define RELAY_WATER_HEATER 4   // D2 - Relay 2 (Water Heater) 
+#define RELAY_WATER_PUMP   14  // D5 - Relay 3 (Water Pump)
+#define RGB_DATA_PIN       12  // D6 - RGB Pixels
+#define BUTTON_1           13  // D7 - Main Control Button
+#define BUTTON_2           16  // D0 - Water Pump Button
+
+// RGB LED Configuration
+#define NUM_LEDS 2
+CRGB leds[NUM_LEDS];
+
+// WiFi Configuration (adjust for your network)
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Web server for Home Assistant integration
+ESP8266WebServer server(80);
+
+// State Management
+enum SystemState {
+  STATE_OFF = 0,
+  STATE_INDUCTION_ON = 1,
+  STATE_WATER_HEATER_ON = 2
+};
+
+SystemState currentState = STATE_OFF;
+bool waterPumpActive = false;
+
+// Button Management
+bool button1Pressed = false;
+bool button2Pressed = false;
+unsigned long button1LastPress = 0;
+unsigned long button2LastPress = 0;
+const unsigned long debounceDelay = 200; // 200ms debounce
+
+// Timer Management
+unsigned long waterHeaterStartTime = 0;
+unsigned long waterPumpStartTime = 0;
+const unsigned long WATER_HEATER_DURATION = 45UL * 60UL * 1000UL; // 45 minutes
+const unsigned long WATER_PUMP_DURATION = 60UL * 60UL * 1000UL;   // 1 hour
+
+// LED Animation Variables
+unsigned long lastLEDUpdate = 0;
+uint8_t animationStep = 0;
+const unsigned long LED_UPDATE_INTERVAL = 50; // 50ms for smooth animation
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Kitchen Control System Starting...");
+  
+  // Initialize pins
+  pinMode(RELAY_INDUCTION, OUTPUT);
+  pinMode(RELAY_WATER_HEATER, OUTPUT);
+  pinMode(RELAY_WATER_PUMP, OUTPUT);
+  pinMode(BUTTON_1, INPUT_PULLUP);
+  pinMode(BUTTON_2, INPUT_PULLUP);
+  
+  // Initialize all relays to OFF
+  digitalWrite(RELAY_INDUCTION, HIGH);    // Assuming active LOW relays
+  digitalWrite(RELAY_WATER_HEATER, HIGH);
+  digitalWrite(RELAY_WATER_PUMP, HIGH);
+  
+  // Initialize RGB LEDs
+  FastLED.addLeds<WS2812B, RGB_DATA_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(100);
+  
+  // Clear LEDs
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  FastLED.show();
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Setup web server routes for Home Assistant
+  setupWebServer();
+  server.begin();
+  
+  Serial.println("System Ready!");
+}
+
+void loop() {
+  // Handle web server requests
+  server.handleClient();
+  
+  // Read and process buttons
+  handleButtons();
+  
+  // Check timers
+  checkTimers();
+  
+  // Update LED animations
+  updateLEDs();
+  
+  // Small delay to prevent excessive CPU usage
+  delay(10);
+}
+
+void handleButtons() {
+  unsigned long currentTime = millis();
+  
+  // Button 1 - Main Control (Induction/Water Heater cycle)
+  if (digitalRead(BUTTON_1) == LOW && !button1Pressed && 
+      (currentTime - button1LastPress > debounceDelay)) {
+    button1Pressed = true;
+    button1LastPress = currentTime;
+    handleButton1Press();
+    Serial.println("Button 1 pressed - State changed");
+  }
+  if (digitalRead(BUTTON_1) == HIGH) {
+    button1Pressed = false;
+  }
+  
+  // Button 2 - Water Pump Toggle
+  if (digitalRead(BUTTON_2) == LOW && !button2Pressed && 
+      (currentTime - button2LastPress > debounceDelay)) {
+    button2Pressed = true;
+    button2LastPress = currentTime;
+    toggleWaterPump();
+    Serial.println("Button 2 pressed - Water pump toggled");
+  }
+  if (digitalRead(BUTTON_2) == HIGH) {
+    button2Pressed = false;
+  }
+}
+
+void handleButton1Press() {
+  switch (currentState) {
+    case STATE_OFF:
+      // Turn on Induction Cooktop
+      setInductionState(true);
+      setWaterHeaterState(false);
+      currentState = STATE_INDUCTION_ON;
+      break;
+      
+    case STATE_INDUCTION_ON:
+      // Turn off Induction, turn on Water Heater
+      setInductionState(false);
+      setWaterHeaterState(true);
+      currentState = STATE_WATER_HEATER_ON;
+      waterHeaterStartTime = millis(); // Start 45-minute timer
+      break;
+      
+    case STATE_WATER_HEATER_ON:
+      // Turn off Water Heater
+      setWaterHeaterState(false);
+      currentState = STATE_OFF;
+      waterHeaterStartTime = 0;
+      break;
+  }
+}
+
+void toggleWaterPump() {
+  waterPumpActive = !waterPumpActive;
+  setWaterPumpState(waterPumpActive);
+  
+  if (waterPumpActive) {
+    waterPumpStartTime = millis(); // Start 1-hour timer
+  } else {
+    waterPumpStartTime = 0;
+  }
+}
+
+void setInductionState(bool state) {
+  digitalWrite(RELAY_INDUCTION, !state); // Active LOW relay
+  Serial.print("Induction Cooktop: ");
+  Serial.println(state ? "ON" : "OFF");
+}
+
+void setWaterHeaterState(bool state) {
+  digitalWrite(RELAY_WATER_HEATER, !state); // Active LOW relay
+  Serial.print("Water Heater: ");
+  Serial.println(state ? "ON" : "OFF");
+}
+
+void setWaterPumpState(bool state) {
+  digitalWrite(RELAY_WATER_PUMP, !state); // Active LOW relay
+  Serial.print("Water Pump: ");
+  Serial.println(state ? "ON" : "OFF");
+}
+
+void checkTimers() {
+  unsigned long currentTime = millis();
+  
+  // Check Water Heater 45-minute timer
+  if (waterHeaterStartTime > 0 && 
+      (currentTime - waterHeaterStartTime >= WATER_HEATER_DURATION)) {
+    Serial.println("Water Heater timer expired - turning off");
+    setWaterHeaterState(false);
+    currentState = STATE_OFF;
+    waterHeaterStartTime = 0;
+  }
+  
+  // Check Water Pump 1-hour timer
+  if (waterPumpStartTime > 0 && 
+      (currentTime - waterPumpStartTime >= WATER_PUMP_DURATION)) {
+    Serial.println("Water Pump timer expired - turning off");
+    setWaterPumpState(false);
+    waterPumpActive = false;
+    waterPumpStartTime = 0;
+  }
+}
+
+void updateLEDs() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastLEDUpdate < LED_UPDATE_INTERVAL) {
+    return;
+  }
+  lastLEDUpdate = currentTime;
+  animationStep++;
+  
+  // Pixel 1 - System State Indicator
+  switch (currentState) {
+    case STATE_OFF:
+      leds[0] = CRGB::Black; // Off
+      break;
+      
+    case STATE_INDUCTION_ON:
+      leds[0] = CRGB::Red; // Steady red
+      break;
+      
+    case STATE_WATER_HEATER_ON:
+      // Oscillating purple/orange
+      if ((animationStep / 20) % 2 == 0) {
+        leds[0] = CRGB::Purple;
+      } else {
+        leds[0] = CRGB::Orange;
+      }
+      break;
+  }
+  
+  // Pixel 2 - Water Pump Indicator
+  if (waterPumpActive) {
+    // Blue/green slow pulse
+    uint8_t pulse = beatsin8(30); // Slow pulse (30 BPM)
+    leds[1] = blend(CRGB::Blue, CRGB::Green, pulse);
+  } else {
+    leds[1] = CRGB::Black; // Off when pump not active
+  }
+  
+  FastLED.show();
+}
+
+void setupWebServer() {
+  // Home Assistant compatible endpoints
+  
+  // Status endpoint
+  server.on("/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"induction\":" + String(currentState == STATE_INDUCTION_ON ? "true" : "false") + ",";
+    json += "\"water_heater\":" + String(currentState == STATE_WATER_HEATER_ON ? "true" : "false") + ",";
+    json += "\"water_pump\":" + String(waterPumpActive ? "true" : "false") + ",";
+    json += "\"state\":" + String(currentState);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  // Control endpoints
+  server.on("/induction/on", HTTP_POST, []() {
+    setInductionState(true);
+    setWaterHeaterState(false);
+    currentState = STATE_INDUCTION_ON;
+    server.send(200, "text/plain", "Induction ON");
+  });
+  
+  server.on("/induction/off", HTTP_POST, []() {
+    setInductionState(false);
+    if (currentState == STATE_INDUCTION_ON) {
+      currentState = STATE_OFF;
+    }
+    server.send(200, "text/plain", "Induction OFF");
+  });
+  
+  server.on("/heater/on", HTTP_POST, []() {
+    setWaterHeaterState(true);
+    setInductionState(false);
+    currentState = STATE_WATER_HEATER_ON;
+    waterHeaterStartTime = millis();
+    server.send(200, "text/plain", "Water Heater ON");
+  });
+  
+  server.on("/heater/off", HTTP_POST, []() {
+    setWaterHeaterState(false);
+    if (currentState == STATE_WATER_HEATER_ON) {
+      currentState = STATE_OFF;
+    }
+    waterHeaterStartTime = 0;
+    server.send(200, "text/plain", "Water Heater OFF");
+  });
+  
+  server.on("/pump/on", HTTP_POST, []() {
+    setWaterPumpState(true);
+    waterPumpActive = true;
+    waterPumpStartTime = millis();
+    server.send(200, "text/plain", "Water Pump ON");
+  });
+  
+  server.on("/pump/off", HTTP_POST, []() {
+    setWaterPumpState(false);
+    waterPumpActive = false;
+    waterPumpStartTime = 0;
+    server.send(200, "text/plain", "Water Pump OFF");
+  });
+  
+  // Root endpoint
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/plain", "Kitchen Control System Online");
+  });
+}
