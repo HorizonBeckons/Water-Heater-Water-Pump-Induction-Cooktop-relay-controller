@@ -1,88 +1,345 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <FastLED.h>
+esphome:
+  name: kitchen-panel
+  friendly_name: Kitchen Control Panel
 
-// Pin Definitions
-#define RELAY_INDUCTION    5   // D1 - Relay 1 (Induction Cooktop)
-#define RELAY_WATER_HEATER 4   // D2 - Relay 2 (Water Heater) 
-#define RELAY_WATER_PUMP   14  // D5 - Relay 3 (Water Pump)
-#define RGB_DATA_PIN       12  // D6 - RGB Pixels
-#define BUTTON_1           13  // D7 - Main Control Button
-#define BUTTON_2           16  // D0 - Water Pump Button
+esp8266:
+  board: d1_mini
 
-// RGB LED Configuration
-#define NUM_LEDS 2
-CRGB leds[NUM_LEDS];
+# Enable logging
+logger:
 
-// WiFi Configuration (adjust for your network)
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "YOUR_ENCRYPTION_KEY_HERE"
 
-// Web server for Home Assistant integration
-ESP8266WebServer server(80);
+ota:
+  - platform: esphome
+    password: "YOUR_OTA_PASSWORD_HERE"
 
-// State Management
-enum SystemState {
-  STATE_OFF = 0,
-  STATE_INDUCTION_ON = 1,
-  STATE_WATER_HEATER_ON = 2
-};
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
 
-SystemState currentState = STATE_OFF;
-bool waterPumpActive = false;
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Kitchen-Panel Fallback Hotspot"
+    password: "fallback123"
 
-// Button Management
-bool button1Pressed = false;
-bool button2Pressed = false;
-unsigned long button1LastPress = 0;
-unsigned long button2LastPress = 0;
-const unsigned long debounceDelay = 200; // 200ms debounce
+captive_portal:
 
-// Timer Management
-unsigned long waterHeaterStartTime = 0;
-unsigned long waterPumpStartTime = 0;
-const unsigned long WATER_HEATER_DURATION = 45UL * 60UL * 1000UL; // 45 minutes
-const unsigned long WATER_PUMP_DURATION = 60UL * 60UL * 1000UL;   // 1 hour
+# Status LED
+status_led:
+  pin:
+    number: GPIO2
+    inverted: true
 
-// LED Animation Variables
-unsigned long lastLEDUpdate = 0;
-uint8_t animationStep = 0;
-const unsigned long LED_UPDATE_INTERVAL = 50; // 50ms for smooth animation
+# Global variables for state management
+globals:
+  - id: system_state
+    type: int
+    restore_value: true
+    initial_value: '0'  # 0=OFF, 1=INDUCTION, 2=WATER_HEATER
+  - id: water_heater_start_time
+    type: unsigned long
+    restore_value: false
+    initial_value: '0'
+  - id: water_pump_start_time
+    type: unsigned long
+    restore_value: false
+    initial_value: '0'
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("Kitchen Control System Starting...");
-  
-  // Initialize pins
-  pinMode(RELAY_INDUCTION, OUTPUT);
-  pinMode(RELAY_WATER_HEATER, OUTPUT);
-  pinMode(RELAY_WATER_PUMP, OUTPUT);
-  pinMode(BUTTON_1, INPUT_PULLUP);
-  pinMode(BUTTON_2, INPUT_PULLUP);
-  
-  // Initialize all relays to OFF
-  digitalWrite(RELAY_INDUCTION, HIGH);    // Assuming active LOW relays
-  digitalWrite(RELAY_WATER_HEATER, HIGH);
-  digitalWrite(RELAY_WATER_PUMP, HIGH);
-  
-  // Initialize RGB LEDs
-  FastLED.addLeds<WS2812B, RGB_DATA_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(100);
-  
-  // Clear LEDs
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  FastLED.show();
-  
-  // Connect to WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Connected! IP address: ");
-  Serial.println(WiFi.localIP());
+# Binary sensors for buttons
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO13  # D7
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Control Button"
+    id: button_1
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - script.execute: handle_button_1_press
+
+  - platform: gpio
+    pin:
+      number: GPIO16  # D0
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Water Pump Button"
+    id: button_2
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      - script.execute: toggle_water_pump
+
+# Switches for relays
+switch:
+  - platform: gpio
+    pin:
+      number: GPIO5  # D1
+      inverted: true  # Active LOW relay
+    name: "Induction Cooktop"
+    id: induction_relay
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    pin:
+      number: GPIO4  # D2
+      inverted: true  # Active LOW relay
+    name: "Water Heater"
+    id: water_heater_relay
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    pin:
+      number: GPIO14  # D5
+      inverted: true  # Active LOW relay
+    name: "Water Pump"
+    id: water_pump_relay
+    restore_mode: ALWAYS_OFF
+
+# Template switches for logical control
+  - platform: template
+    name: "System Control"
+    id: system_control
+    turn_on_action:
+      - script.execute: handle_button_1_press
+    turn_off_action:
+      - script.execute: system_off
+
+  - platform: template
+    name: "Water Pump Control"
+    id: pump_control
+    lambda: |-
+      return id(water_pump_relay).state;
+    turn_on_action:
+      - script.execute: water_pump_on
+    turn_off_action:
+      - script.execute: water_pump_off
+
+# RGB LEDs
+light:
+  - platform: fastled_clockless
+    chipset: WS2812B
+    pin: GPIO12  # D6
+    num_leds: 2
+    rgb_order: GRB
+    name: "Status LEDs"
+    id: status_leds
+    effects:
+      - pulse:
+          name: "Slow Pulse"
+          transition_length: 2s
+          update_interval: 2s
+      - strobe:
+          name: "Purple Orange Oscillate"
+          colors:
+            - state: true
+              color:
+                red: 128
+                green: 0
+                blue: 128
+              duration: 1s
+            - state: true
+              color:
+                red: 255
+                green: 165
+                blue: 0
+              duration: 1s
+
+# Sensors for timers
+sensor:
+  - platform: template
+    name: "Water Heater Timer"
+    id: water_heater_timer
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(water_heater_start_time) == 0) {
+        return 0;
+      }
+      unsigned long elapsed = millis() - id(water_heater_start_time);
+      unsigned long remaining = 2700000 - elapsed;  // 45 minutes in ms
+      if (remaining <= 0) {
+        return 0;
+      }
+      return remaining / 60000;  // Convert to minutes
+
+  - platform: template
+    name: "Water Pump Timer"
+    id: water_pump_timer
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(water_pump_start_time) == 0) {
+        return 0;
+      }
+      unsigned long elapsed = millis() - id(water_pump_start_time);
+      unsigned long remaining = 3600000 - elapsed;  // 60 minutes in ms
+      if (remaining <= 0) {
+        return 0;
+      }
+      return remaining / 60000;  // Convert to minutes
+
+# Text sensor for system state
+text_sensor:
+  - platform: template
+    name: "System State"
+    id: system_state_text
+    update_interval: 1s
+    lambda: |-
+      switch (id(system_state)) {
+        case 0: return {"Off"};
+        case 1: return {"Induction Cooktop"};
+        case 2: return {"Water Heater"};
+        default: return {"Unknown"};
+      }
+
+# Scripts for control logic
+script:
+  - id: handle_button_1_press
+    then:
+      - lambda: |-
+          int current_state = id(system_state);
+          ESP_LOGD("kitchen", "Button 1 pressed, current state: %d", current_state);
+          
+          switch (current_state) {
+            case 0:  // OFF -> INDUCTION ON
+              id(induction_relay).turn_on();
+              id(water_heater_relay).turn_off();
+              id(system_state) = 1;
+              break;
+              
+            case 1:  // INDUCTION ON -> WATER HEATER ON
+              id(induction_relay).turn_off();
+              id(water_heater_relay).turn_on();
+              id(system_state) = 2;
+              id(water_heater_start_time) = millis();
+              break;
+              
+            case 2:  // WATER HEATER ON -> OFF
+              id(water_heater_relay).turn_off();
+              id(system_state) = 0;
+              id(water_heater_start_time) = 0;
+              break;
+          }
+      - script.execute: update_leds
+
+  - id: system_off
+    then:
+      - switch.turn_off: induction_relay
+      - switch.turn_off: water_heater_relay
+      - lambda: |-
+          id(system_state) = 0;
+          id(water_heater_start_time) = 0;
+      - script.execute: update_leds
+
+  - id: toggle_water_pump
+    then:
+      - lambda: |-
+          if (id(water_pump_relay).state) {
+            // Turn off
+            id(water_pump_relay).turn_off();
+            id(water_pump_start_time) = 0;
+          } else {
+            // Turn on
+            id(water_pump_relay).turn_on();
+            id(water_pump_start_time) = millis();
+          }
+      - script.execute: update_leds
+
+  - id: water_pump_on
+    then:
+      - switch.turn_on: water_pump_relay
+      - lambda: |-
+          id(water_pump_start_time) = millis();
+      - script.execute: update_leds
+
+  - id: water_pump_off
+    then:
+      - switch.turn_off: water_pump_relay
+      - lambda: |-
+          id(water_pump_start_time) = 0;
+      - script.execute: update_leds
+
+  - id: update_leds
+    then:
+      - lambda: |-
+          auto call = id(status_leds).turn_on();
+          
+          // Pixel 1 - System State
+          switch (id(system_state)) {
+            case 0:  // OFF
+              call.set_single_light_color_mode();
+              call.set_rgb(0, 0, 0);  // Black/Off
+              break;
+              
+            case 1:  // INDUCTION ON
+              call.set_single_light_color_mode();
+              call.set_rgb(1.0, 0, 0);  // Red
+              break;
+              
+            case 2:  // WATER HEATER ON
+              call.set_effect("Purple Orange Oscillate");
+              break;
+          }
+          
+          call.perform();
+          
+          // Handle Pixel 2 separately for water pump
+          if (id(water_pump_relay).state) {
+            // Water pump is on - blue/green pulse
+            auto call2 = id(status_leds).turn_on();
+            call2.set_effect("Slow Pulse");
+            call2.set_rgb(0, 0.5, 1.0);  // Blue-green
+            call2.perform();
+          }
+
+  - id: check_timers
+    then:
+      - lambda: |-
+          unsigned long current_time = millis();
+          
+          // Check water heater timer (45 minutes)
+          if (id(water_heater_start_time) > 0 && 
+              (current_time - id(water_heater_start_time) >= 2700000)) {  // 45 min = 2,700,000 ms
+            ESP_LOGD("kitchen", "Water heater timer expired");
+            id(water_heater_relay).turn_off();
+            id(system_state) = 0;
+            id(water_heater_start_time) = 0;
+            id(update_leds).execute();
+          }
+          
+          // Check water pump timer (60 minutes)
+          if (id(water_pump_start_time) > 0 && 
+              (current_time - id(water_pump_start_time) >= 3600000)) {  // 60 min = 3,600,000 ms
+            ESP_LOGD("kitchen", "Water pump timer expired");
+            id(water_pump_relay).turn_off();
+            id(water_pump_start_time) = 0;
+            id(update_leds).execute();
+          }
+
+# Interval to check timers every 30 seconds
+interval:
+  - interval: 30s
+    then:
+      - script.execute: check_timers
+
+# Update LEDs every 5 seconds
+  - interval: 5s
+    then:
+      - script.execute: update_leds  Serial.println(WiFi.localIP());
   
   // Setup web server routes for Home Assistant
   setupWebServer();
